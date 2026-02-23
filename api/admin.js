@@ -193,6 +193,13 @@ export default async function handler(req, res) {
 
     return res.status(400).json({ error: 'Invalid action' });
   } catch (err) {
+    console.error('admin api error', {
+      method: req.method,
+      action: req.query?.action,
+      id: req.query?.id || null,
+      message: err && err.message ? err.message : String(err),
+      stack: err && err.stack ? err.stack : null
+    });
     return res.status(500).json({ error: 'Server error' });
   }
 }
