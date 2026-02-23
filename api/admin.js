@@ -46,7 +46,7 @@ function applyCors(req, res) {
     res.setHeader('Access-Control-Allow-Origin', origin);
     res.setHeader('Vary', 'Origin');
   }
-  res.setHeader('Access-Control-Allow-Methods', 'GET, PUT, DELETE, OPTIONS');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, x-admin-password');
 }
 
@@ -131,6 +131,26 @@ export default async function handler(req, res) {
 
       await col.updateOne({ _id: oid }, { $set: updates });
       return res.status(200).json({ success: true });
+    }
+
+    // ── CREATE a film directly (admin shortcut) ─────────────────
+    if (req.method === 'POST' && action === 'create') {
+      const raw = req.body && typeof req.body === 'object' ? req.body : {};
+      if (!raw.title || !raw.director) {
+        return res.status(400).json({ error: 'Missing required fields' });
+      }
+
+      const film = {};
+      for (const [k, v] of Object.entries(raw)) {
+        if (ALLOWED_UPDATE_FIELDS.has(k)) film[k] = v;
+      }
+      film.timestamp = film.timestamp || new Date().toISOString();
+      film.pending = false;
+      film.accepted = typeof film.accepted === 'boolean' ? film.accepted : true;
+      film.live = typeof film.live === 'boolean' ? film.live : true;
+
+      const insertRes = await col.insertOne(film);
+      return res.status(201).json({ success: true, id: String(insertRes.insertedId) });
     }
 
     // ── APPROVE a pending submission ───────────────────────────
