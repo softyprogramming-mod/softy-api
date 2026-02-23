@@ -2,12 +2,14 @@
 // All routes require x-admin-password header matching ADMIN_PASSWORD env var
 //
 // GET    /api/admin?action=list            → all films (including hidden)
+// POST   /api/admin?action=generateReview  → generate review from full template set
 // PUT    /api/admin?action=update&id=xxx   → edit a film
 // PUT    /api/admin?action=approve&id=xxx  → approve pending submission + set review
 // DELETE /api/admin?action=delete&id=xxx   → delete a film
 // PUT    /api/admin?action=toggle&id=xxx   → toggle live/hidden
 
 import clientPromise from '../lib/mongodb.js';
+import { generateReview } from '../lib/review-generator.js';
 import { ObjectId } from 'mongodb';
 import crypto from 'crypto';
 
@@ -117,6 +119,11 @@ export default async function handler(req, res) {
     if (req.method === 'GET' && action === 'list') {
       const films = await col.find({}).sort({ timestamp: -1 }).toArray();
       return res.status(200).json({ films });
+    }
+
+    if (req.method === 'POST' && action === 'generateReview') {
+      const payload = req.body && typeof req.body === 'object' ? req.body : {};
+      return res.status(200).json({ review: generateReview(payload) });
     }
 
     // ── UPDATE a film ───────────────────────────────────────────
