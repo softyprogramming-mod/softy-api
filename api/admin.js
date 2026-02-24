@@ -3,6 +3,7 @@
 //
 // GET    /api/admin?action=list            → all films (including hidden)
 // POST   /api/admin?action=generateReview  → generate review from full template set
+// POST   /api/admin?action=reorder         → reorder accepted films (top = hero)
 // PUT    /api/admin?action=update&id=xxx   → edit a film
 // PUT    /api/admin?action=approve&id=xxx  → approve pending submission + set review
 // DELETE /api/admin?action=delete&id=xxx   → delete a film
@@ -24,8 +25,22 @@ const ALLOWED_UPDATE_FIELDS = new Set([
   'title', 'director', 'writer', 'producer', 'genre', 'runtime',
   'logline', 'directorStatement', 'filmLink', 'thumbnail', 'slug',
   'review', 'twitter', 'onlinePremiere', 'cast', 'language',
-  'pending', 'live', 'accepted', 'timestamp'
+  'pending', 'live', 'accepted', 'timestamp', 'sortOrder'
 ]);
+
+function hasNumericSortOrder(film) {
+  return Number.isFinite(film && film.sortOrder);
+}
+
+function compareFilmsForAdmin(a, b) {
+  const aHas = hasNumericSortOrder(a);
+  const bHas = hasNumericSortOrder(b);
+  if (aHas && bHas && a.sortOrder !== b.sortOrder) return a.sortOrder - b.sortOrder;
+  if (aHas !== bHas) return aHas ? -1 : 1;
+  const aTime = a && a.timestamp ? new Date(a.timestamp).getTime() : 0;
+  const bTime = b && b.timestamp ? new Date(b.timestamp).getTime() : 0;
+  return bTime - aTime;
+}
 
 function getAllowedOrigins() {
   const fromEnv = String(process.env.ALLOWED_ORIGINS || '')
@@ -117,13 +132,44 @@ export default async function handler(req, res) {
 
     // ── LIST all films ──────────────────────────────────────────
     if (req.method === 'GET' && action === 'list') {
-      const films = await col.find({}).sort({ timestamp: -1 }).toArray();
+      const films = (await col.find({}).toArray()).sort(compareFilmsForAdmin);
       return res.status(200).json({ films });
     }
 
     if (req.method === 'POST' && action === 'generateReview') {
       const payload = req.body && typeof req.body === 'object' ? req.body : {};
       return res.status(200).json({ review: generateReview(payload) });
+    }
+
+    if (req.method === 'POST' && action === 'reorder') {
+      const payload = req.body && typeof req.body === 'object' ? req.body : {};
+      const ids = Array.isArray(payload.ids) ? payload.ids.map(v => String(v)) : [];
+      if (!ids.length) {
+        return res.status(400).json({ error: 'Missing ids' });
+      }
+      if (ids.some(v => !ObjectId.isValid(v))) {
+        return res.status(400).json({ error: 'Invalid ids' });
+      }
+
+      const objectIds = ids.map(v => new ObjectId(v));
+      const existing = await col.find({ _id: { $in: objectIds } }).project({ _id: 1, pending: 1 }).toArray();
+      const existingSet = new Set(existing.map(doc => String(doc._id)));
+      if (ids.some(v => !existingSet.has(v))) {
+        return res.status(400).json({ error: 'Unknown film id in reorder list' });
+      }
+      if (existing.some(doc => doc.pending === true)) {
+        return res.status(400).json({ error: 'Pending submissions cannot be reordered here' });
+      }
+
+      await col.bulkWrite(
+        ids.map((filmId, index) => ({
+          updateOne: {
+            filter: { _id: new ObjectId(filmId) },
+            update: { $set: { sortOrder: index } }
+          }
+        }))
+      );
+      return res.status(200).json({ success: true, count: ids.length });
     }
 
     // ── UPDATE a film ───────────────────────────────────────────

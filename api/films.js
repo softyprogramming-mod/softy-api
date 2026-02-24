@@ -67,6 +67,20 @@ function timingSafeEquals(a, b) {
   return crypto.timingSafeEqual(aBuf, bBuf);
 }
 
+function hasNumericSortOrder(film) {
+  return Number.isFinite(film && film.sortOrder);
+}
+
+function compareFilmsForPublic(a, b) {
+  const aHas = hasNumericSortOrder(a);
+  const bHas = hasNumericSortOrder(b);
+  if (aHas && bHas && a.sortOrder !== b.sortOrder) return a.sortOrder - b.sortOrder;
+  if (aHas !== bHas) return aHas ? -1 : 1;
+  const aTime = a && a.timestamp ? new Date(a.timestamp).getTime() : 0;
+  const bTime = b && b.timestamp ? new Date(b.timestamp).getTime() : 0;
+  return bTime - aTime;
+}
+
 function sanitizeForPublic(film) {
   return {
     submissionId: film.submissionId || '',
@@ -108,11 +122,10 @@ export default async function handler(req, res) {
     if (req.method === 'GET') {
       const films = await col
         .find({ live: true })
-        .sort({ timestamp: -1 })
         .toArray();
 
       // Remove sensitive fields before sending to public
-      const safe = films.map(sanitizeForPublic);
+      const safe = films.slice().sort(compareFilmsForPublic).map(sanitizeForPublic);
       return res.status(200).json({ films: safe });
     }
 
