@@ -17,6 +17,8 @@ import crypto from 'crypto';
 
 const DB_NAME = 'shortsoftheyear';
 const COLLECTION = 'films';
+const SETTINGS_COLLECTION = 'adminSettings';
+const REJECTION_ARC_DOC_ID = 'rejectionArc';
 const RATE_LIMIT_WINDOW_MS = 60 * 1000;
 const RATE_LIMIT_MAX = 120;
 const rateState = globalThis.__softyAdminRateState || new Map();
@@ -28,6 +30,100 @@ const ALLOWED_UPDATE_FIELDS = new Set([
   'review', 'twitter', 'onlinePremiere', 'completionDate', 'cast', 'language',
   'pending', 'live', 'accepted', 'timestamp', 'sortOrder'
 ]);
+
+const ARC_DELAY_UNITS = new Set(['minutes', 'hours', 'days']);
+const ARC_STEP_TYPES = new Set(['custom', 'acceptance_builtin']);
+
+function defaultRejectionArcConfig() {
+  return {
+    enabled: false,
+    steps: [
+      {
+        id: 'step_1',
+        name: 'Email 1',
+        senderName: 'The SoftY Jury',
+        subject: 'Your submission to Shorts of the Year',
+        body: '',
+        delayAmount: 0,
+        delayUnit: 'hours',
+        enabled: true
+      }
+    ],
+    updatedAt: null
+  };
+}
+
+function clampInt(value, fallback, min, max) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return fallback;
+  const i = Math.round(n);
+  return Math.min(max, Math.max(min, i));
+}
+
+function cleanText(value, maxLen = 1000) {
+  return String(value == null ? '' : value).replace(/\r\n/g, '\n').slice(0, maxLen);
+}
+
+function normalizeRejectionArcStep(raw, index) {
+  const step = raw && typeof raw === 'object' ? raw : {};
+  const id = cleanText(step.id || `step_${index + 1}`, 64).trim() || `step_${index + 1}`;
+  const name = cleanText(step.name || `Email ${index + 1}`, 80).trim() || `Email ${index + 1}`;
+  const senderName = cleanText(step.senderName || 'Shorts of the Year', 140).trim();
+  const subject = cleanText(step.subject || '', 300).trim();
+  const body = cleanText(step.body || '', 20000);
+  const delayAmount = clampInt(step.delayAmount, 0, 0, 10000);
+  const delayUnit = ARC_DELAY_UNITS.has(String(step.delayUnit || '').toLowerCase())
+    ? String(step.delayUnit).toLowerCase()
+    : 'hours';
+  const enabled = step.enabled !== false;
+  const stepType = ARC_STEP_TYPES.has(String(step.stepType || '').toLowerCase())
+    ? String(step.stepType).toLowerCase()
+    : 'custom';
+  const triggerAcceptanceFollowup = stepType === 'acceptance_builtin'
+    ? true
+    : step.triggerAcceptanceFollowup === true;
+
+  return {
+    id,
+    name,
+    senderName,
+    subject,
+    body,
+    delayAmount,
+    delayUnit,
+    enabled,
+    stepType,
+    triggerAcceptanceFollowup
+  };
+}
+
+function normalizeRejectionArcConfig(raw, options = {}) {
+  const incoming = raw && typeof raw === 'object' ? raw : {};
+  const stepsRaw = Array.isArray(incoming.steps) ? incoming.steps : [];
+  const steps = stepsRaw
+    .map((step, idx) => normalizeRejectionArcStep(step, idx))
+    .filter(Boolean)
+    .slice(0, 25);
+
+  const unique = [];
+  const seen = new Set();
+  steps.forEach((step, idx) => {
+    let id = step.id || `step_${idx + 1}`;
+    if (seen.has(id)) {
+      let n = 2;
+      while (seen.has(`${id}_${n}`)) n += 1;
+      id = `${id}_${n}`;
+    }
+    seen.add(id);
+    unique.push({ ...step, id });
+  });
+
+  return {
+    enabled: incoming.enabled !== false,
+    steps: unique.length ? unique : defaultRejectionArcConfig().steps,
+    updatedAt: options.preserveUpdatedAt ? (incoming.updatedAt || null) : new Date().toISOString()
+  };
+}
 
 function hasNumericSortOrder(film) {
   return Number.isFinite(film && film.sortOrder);
@@ -162,6 +258,7 @@ export default async function handler(req, res) {
     const client = await clientPromise;
     const db = client.db(DB_NAME);
     const col = db.collection(COLLECTION);
+    const settingsCol = db.collection(SETTINGS_COLLECTION);
     const { action, id } = req.query;
 
     // ── LIST all films ──────────────────────────────────────────
@@ -173,6 +270,25 @@ export default async function handler(req, res) {
     if (req.method === 'POST' && action === 'generateReview') {
       const payload = req.body && typeof req.body === 'object' ? req.body : {};
       return res.status(200).json({ review: generateReview(payload) });
+    }
+
+    if (req.method === 'GET' && action === 'rejectionArc') {
+      const doc = await settingsCol.findOne({ _id: REJECTION_ARC_DOC_ID });
+      const config = doc && typeof doc === 'object'
+        ? normalizeRejectionArcConfig(doc, { preserveUpdatedAt: true })
+        : defaultRejectionArcConfig();
+      return res.status(200).json({ config });
+    }
+
+    if (req.method === 'PUT' && action === 'rejectionArc') {
+      const payload = req.body && typeof req.body === 'object' ? req.body : {};
+      const config = normalizeRejectionArcConfig(payload);
+      await settingsCol.updateOne(
+        { _id: REJECTION_ARC_DOC_ID },
+        { $set: { ...config } },
+        { upsert: true }
+      );
+      return res.status(200).json({ success: true, config });
     }
 
     if (req.method === 'POST' && action === 'reorder') {
