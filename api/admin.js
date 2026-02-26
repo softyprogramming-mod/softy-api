@@ -6,6 +6,7 @@
 // POST   /api/admin?action=reorder         → reorder accepted films (top = hero)
 // PUT    /api/admin?action=update&id=xxx   → edit a film
 // PUT    /api/admin?action=approve&id=xxx  → approve pending submission + set review
+// DELETE /api/admin?action=reject&id=xxx   → reject pending submission + send rejection email
 // DELETE /api/admin?action=delete&id=xxx   → delete a film
 // PUT    /api/admin?action=toggle&id=xxx   → toggle live/hidden
 
@@ -113,6 +114,39 @@ function toObjectId(id, res) {
     return null;
   }
   return new ObjectId(String(id));
+}
+
+async function callAppsScriptRejectWebhook(submissionId) {
+  const url = String(process.env.APPS_SCRIPT_WEBHOOK_URL || '').trim();
+  if (!url) {
+    return { ok: false, status: 500, error: 'APPS_SCRIPT_WEBHOOK_URL not configured' };
+  }
+
+  const secret = String(process.env.APPS_SCRIPT_WEBHOOK_SECRET || process.env.ADMIN_PASSWORD || '').trim();
+  if (!secret) {
+    return { ok: false, status: 500, error: 'APPS_SCRIPT_WEBHOOK_SECRET not configured' };
+  }
+
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      action: 'manualReject',
+      submissionId,
+      secret
+    })
+  });
+
+  let data = null;
+  try { data = await res.json(); } catch (_) {}
+  if (!res.ok || (data && data.success === false)) {
+    return {
+      ok: false,
+      status: res.status,
+      error: (data && data.error) || ('Webhook failed with HTTP ' + res.status)
+    };
+  }
+  return { ok: true, status: res.status, data };
 }
 
 export default async function handler(req, res) {
@@ -241,6 +275,27 @@ export default async function handler(req, res) {
 
       await col.updateOne({ _id: oid }, { $set: { live: !film.live } });
       return res.status(200).json({ success: true, live: !film.live });
+    }
+
+    // ── REJECT a pending submission (send email + cleanup) ──────
+    if (req.method === 'DELETE' && action === 'reject' && id) {
+      const oid = toObjectId(id, res);
+      if (!oid) return;
+      const film = await col.findOne({ _id: oid });
+      if (!film) return res.status(404).json({ error: 'Not found' });
+      if (!film.pending) {
+        return res.status(400).json({ error: 'Reject action is only for pending submissions' });
+      }
+      if (!film.submissionId) {
+        return res.status(400).json({ error: 'Missing submissionId on pending record' });
+      }
+
+      const webhook = await callAppsScriptRejectWebhook(String(film.submissionId));
+      if (!webhook.ok) {
+        return res.status(webhook.status || 502).json({ error: webhook.error || 'Reject webhook failed' });
+      }
+
+      return res.status(200).json({ success: true });
     }
 
     // ── DELETE a film ───────────────────────────────────────────
