@@ -212,7 +212,7 @@ function toObjectId(id, res) {
   return new ObjectId(String(id));
 }
 
-async function callAppsScriptRejectWebhook(submissionId) {
+async function callAppsScriptWebhook(payload) {
   const url = String(process.env.APPS_SCRIPT_WEBHOOK_URL || '').trim();
   if (!url) {
     return { ok: false, status: 500, error: 'APPS_SCRIPT_WEBHOOK_URL not configured' };
@@ -226,11 +226,7 @@ async function callAppsScriptRejectWebhook(submissionId) {
   const res = await fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      action: 'manualReject',
-      submissionId,
-      secret
-    })
+    body: JSON.stringify({ ...(payload || {}), secret })
   });
 
   let data = null;
@@ -243,6 +239,13 @@ async function callAppsScriptRejectWebhook(submissionId) {
     };
   }
   return { ok: true, status: res.status, data };
+}
+
+async function callAppsScriptRejectWebhook(submissionId) {
+  return callAppsScriptWebhook({
+    action: 'manualReject',
+    submissionId
+  });
 }
 
 export default async function handler(req, res) {
@@ -289,6 +292,30 @@ export default async function handler(req, res) {
         { upsert: true }
       );
       return res.status(200).json({ success: true, config });
+    }
+
+    if (req.method === 'GET' && action === 'rejectionArcTracker') {
+      const webhook = await callAppsScriptWebhook({ action: 'arcTracker' });
+      if (!webhook.ok) {
+        return res.status(webhook.status || 502).json({ error: webhook.error || 'Arc tracker webhook failed' });
+      }
+      return res.status(200).json({ arcs: (webhook.data && webhook.data.arcs) || [] });
+    }
+
+    if (req.method === 'POST' && action === 'rejectionArcAdvance') {
+      const payload = req.body && typeof req.body === 'object' ? req.body : {};
+      const arcId = String(payload.arcId || '').trim();
+      if (!arcId) {
+        return res.status(400).json({ error: 'Missing arcId' });
+      }
+      const webhook = await callAppsScriptWebhook({ action: 'arcAdvance', arcId });
+      if (!webhook.ok) {
+        return res.status(webhook.status || 502).json({ error: webhook.error || 'Arc advance webhook failed' });
+      }
+      if (webhook.data && webhook.data.success === false) {
+        return res.status(400).json({ error: webhook.data.error || 'Arc advance failed' });
+      }
+      return res.status(200).json({ success: true, result: webhook.data || {} });
     }
 
     if (req.method === 'POST' && action === 'reorder') {
