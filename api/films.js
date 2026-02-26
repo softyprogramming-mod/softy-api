@@ -96,6 +96,7 @@ function sanitizeForPublic(film) {
     filmLink: film.filmLink || '',
     twitter: film.twitter || '',
     onlinePremiere: film.onlinePremiere || '',
+    completionDate: film.completionDate || '',
     cast: film.cast || '',
     language: film.language || '',
     thumbnail: film.thumbnail || '',

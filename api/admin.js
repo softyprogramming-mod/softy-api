@@ -25,7 +25,7 @@ globalThis.__softyAdminRateState = rateState;
 const ALLOWED_UPDATE_FIELDS = new Set([
   'title', 'director', 'writer', 'producer', 'genre', 'runtime',
   'logline', 'directorStatement', 'filmLink', 'thumbnail', 'slug',
-  'review', 'twitter', 'onlinePremiere', 'cast', 'language',
+  'review', 'twitter', 'onlinePremiere', 'completionDate', 'cast', 'language',
   'pending', 'live', 'accepted', 'timestamp', 'sortOrder'
 ]);
 
