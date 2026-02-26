@@ -331,6 +331,16 @@ export default async function handler(req, res) {
       if (webhook.data && webhook.data.success === false) {
         return res.status(400).json({ error: webhook.data.error || 'Arc cancel failed' });
       }
+      const canceledSubmissionId = String(webhook.data?.submissionId || '').trim();
+      if (canceledSubmissionId) {
+        await col.updateMany(
+          { submissionId: canceledSubmissionId, pending: true },
+          {
+            $set: { rejectionArcActive: false, rejectionArcCanceledAt: new Date().toISOString() },
+            $unset: { rejectionArcId: '' }
+          }
+        );
+      }
       return res.status(200).json({ success: true, result: webhook.data || {} });
     }
 
@@ -420,7 +430,21 @@ export default async function handler(req, res) {
 
       await col.updateOne(
         { _id: oid },
-        { $set: { review, pending: false, live: true, accepted: true, sortOrder: nextTopSortOrder } }
+        {
+          $set: {
+            review,
+            pending: false,
+            live: true,
+            accepted: true,
+            sortOrder: nextTopSortOrder,
+            rejectionArcActive: false
+          },
+          $unset: {
+            rejectionArcId: '',
+            rejectionArcStartedAt: '',
+            rejectionArcCanceledAt: ''
+          }
+        }
       );
       return res.status(200).json({ success: true });
     }
@@ -445,6 +469,9 @@ export default async function handler(req, res) {
       if (!film.pending) {
         return res.status(400).json({ error: 'Reject action is only for pending submissions' });
       }
+      if (film.rejectionArcActive === true) {
+        return res.status(409).json({ error: 'Rejection arc already in progress for this submission' });
+      }
       if (!film.submissionId) {
         return res.status(400).json({ error: 'Missing submissionId on pending record' });
       }
@@ -453,8 +480,34 @@ export default async function handler(req, res) {
       if (!webhook.ok) {
         return res.status(webhook.status || 502).json({ error: webhook.error || 'Reject webhook failed' });
       }
+      if (webhook.data && webhook.data.success === false) {
+        return res.status(400).json({ error: webhook.data.error || 'Reject webhook failed' });
+      }
 
-      return res.status(200).json({ success: true });
+      const shouldRetainPending =
+        webhook.data &&
+        webhook.data.rejectionMode === 'arc' &&
+        webhook.data.rejectionArcStarted === true &&
+        webhook.data.rejectionArcPendingRetained === true;
+
+      if (shouldRetainPending) {
+        await col.updateOne(
+          { _id: oid, pending: true },
+          {
+            $set: {
+              rejectionArcActive: true,
+              rejectionArcId: String(webhook.data.rejectionArcId || ''),
+              rejectionArcStartedAt: new Date().toISOString()
+            }
+          }
+        );
+      }
+
+      return res.status(200).json({
+        success: true,
+        rejectionArcActive: !!shouldRetainPending,
+        rejectionArcId: shouldRetainPending ? String(webhook.data.rejectionArcId || '') : ''
+      });
     }
 
     // ── DELETE a film ───────────────────────────────────────────
