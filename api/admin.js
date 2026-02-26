@@ -318,6 +318,22 @@ export default async function handler(req, res) {
       return res.status(200).json({ success: true, result: webhook.data || {} });
     }
 
+    if (req.method === 'POST' && action === 'rejectionArcCancel') {
+      const payload = req.body && typeof req.body === 'object' ? req.body : {};
+      const arcId = String(payload.arcId || '').trim();
+      if (!arcId) {
+        return res.status(400).json({ error: 'Missing arcId' });
+      }
+      const webhook = await callAppsScriptWebhook({ action: 'arcCancel', arcId });
+      if (!webhook.ok) {
+        return res.status(webhook.status || 502).json({ error: webhook.error || 'Arc cancel webhook failed' });
+      }
+      if (webhook.data && webhook.data.success === false) {
+        return res.status(400).json({ error: webhook.data.error || 'Arc cancel failed' });
+      }
+      return res.status(200).json({ success: true, result: webhook.data || {} });
+    }
+
     if (req.method === 'POST' && action === 'reorder') {
       const payload = req.body && typeof req.body === 'object' ? req.body : {};
       const ids = Array.isArray(payload.ids) ? payload.ids.map(v => String(v)) : [];
