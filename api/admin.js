@@ -211,9 +211,23 @@ export default async function handler(req, res) {
       const oid = toObjectId(id, res);
       if (!oid) return;
       const review = typeof req.body?.review === 'string' ? req.body.review : '';
+
+      // New approvals should become the top hero film by default.
+      // sortOrder is ascending, so place the film before the current minimum.
+      const currentTop = await col
+        .find({ live: true, pending: { $ne: true }, sortOrder: { $type: 'number' } })
+        .project({ sortOrder: 1 })
+        .sort({ sortOrder: 1 })
+        .limit(1)
+        .toArray();
+      const nextTopSortOrder =
+        currentTop.length && Number.isFinite(currentTop[0].sortOrder)
+          ? currentTop[0].sortOrder - 1
+          : 0;
+
       await col.updateOne(
         { _id: oid },
-        { $set: { review, pending: false, live: true, accepted: true } }
+        { $set: { review, pending: false, live: true, accepted: true, sortOrder: nextTopSortOrder } }
       );
       return res.status(200).json({ success: true });
     }
