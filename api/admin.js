@@ -490,13 +490,29 @@ export default async function handler(req, res) {
         webhook.data.rejectionArcStarted === true &&
         webhook.data.rejectionArcPendingRetained === true;
 
-      if (shouldRetainPending) {
+      let arcIdForPending = shouldRetainPending ? String(webhook.data.rejectionArcId || '') : '';
+      let retainPending = !!shouldRetainPending;
+
+      // Backward-compatible fallback: if manualReject response does not include
+      // arc metadata, check tracker for an active arc on this submissionId.
+      if (!retainPending) {
+        const trackerWebhook = await callAppsScriptWebhook({ action: 'arcTracker' });
+        if (trackerWebhook.ok && Array.isArray(trackerWebhook.data?.arcs)) {
+          const activeArc = trackerWebhook.data.arcs.find(a => String(a?.submissionId || '') === String(film.submissionId));
+          if (activeArc) {
+            retainPending = true;
+            arcIdForPending = String(activeArc.arcId || '');
+          }
+        }
+      }
+
+      if (retainPending) {
         await col.updateOne(
           { _id: oid, pending: true },
           {
             $set: {
               rejectionArcActive: true,
-              rejectionArcId: String(webhook.data.rejectionArcId || ''),
+              rejectionArcId: arcIdForPending,
               rejectionArcStartedAt: new Date().toISOString()
             }
           }
@@ -505,8 +521,8 @@ export default async function handler(req, res) {
 
       return res.status(200).json({
         success: true,
-        rejectionArcActive: !!shouldRetainPending,
-        rejectionArcId: shouldRetainPending ? String(webhook.data.rejectionArcId || '') : ''
+        rejectionArcActive: retainPending,
+        rejectionArcId: retainPending ? arcIdForPending : ''
       });
     }
 
