@@ -6,6 +6,7 @@
 // POST   /api/admin?action=reorder         → reorder accepted films (top = hero)
 // PUT    /api/admin?action=update&id=xxx   → edit a film
 // PUT    /api/admin?action=approve&id=xxx  → approve pending submission + set review
+// POST   /api/admin?action=sendAcceptanceEmail&id=xxx → resend acceptance email
 // DELETE /api/admin?action=reject&id=xxx   → reject pending submission + send rejection email
 // DELETE /api/admin?action=delete&id=xxx   → delete a film
 // PUT    /api/admin?action=toggle&id=xxx   → toggle live/hidden
@@ -248,6 +249,32 @@ async function callAppsScriptRejectWebhook(submissionId) {
   });
 }
 
+async function callAppsScriptApproveWebhook(film, review) {
+  return callAppsScriptWebhook({
+    action: 'manualApprove',
+    submissionId: film.submissionId || '',
+    review,
+    film: {
+      title: film.title || '',
+      director: film.director || '',
+      writer: film.writer || '',
+      producer: film.producer || '',
+      genre: film.genre || '',
+      runtime: film.runtime || '',
+      logline: film.logline || '',
+      directorStatement: film.directorStatement || '',
+      email: film.email || '',
+      filmLink: film.filmLink || '',
+      twitter: film.twitter || '',
+      onlinePremiere: film.onlinePremiere || '',
+      completionDate: film.completionDate || '',
+      cast: film.cast || '',
+      language: film.language || '',
+      slug: film.slug || ''
+    }
+  });
+}
+
 export default async function handler(req, res) {
   applyCors(req, res);
   res.setHeader('Cache-Control', 'no-store');
@@ -414,6 +441,22 @@ export default async function handler(req, res) {
       const oid = toObjectId(id, res);
       if (!oid) return;
       const review = typeof req.body?.review === 'string' ? req.body.review : '';
+      const film = await col.findOne({ _id: oid });
+      if (!film) return res.status(404).json({ error: 'Not found' });
+      if (!film.pending) {
+        return res.status(400).json({ error: 'Approve action is only for pending submissions' });
+      }
+      if (!film.email) {
+        return res.status(400).json({ error: 'Missing email on pending record' });
+      }
+
+      const webhook = await callAppsScriptApproveWebhook(film, review);
+      if (!webhook.ok) {
+        return res.status(webhook.status || 502).json({ error: webhook.error || 'Approve webhook failed' });
+      }
+      if (webhook.data && webhook.data.success === false) {
+        return res.status(400).json({ error: webhook.data.error || 'Approve webhook failed' });
+      }
 
       // New approvals should become the top hero film by default.
       // sortOrder is ascending, so place the film before the current minimum.
@@ -428,8 +471,8 @@ export default async function handler(req, res) {
           ? currentTop[0].sortOrder - 1
           : 0;
 
-      await col.updateOne(
-        { _id: oid },
+      const updateRes = await col.updateOne(
+        { _id: oid, pending: true },
         {
           $set: {
             review,
@@ -446,6 +489,36 @@ export default async function handler(req, res) {
           }
         }
       );
+      if (updateRes.matchedCount === 0) {
+        return res.status(409).json({ error: 'Submission was already changed' });
+      }
+      return res.status(200).json({ success: true });
+    }
+
+    // ── RESEND acceptance email for an accepted/live film ───────
+    if (req.method === 'POST' && action === 'sendAcceptanceEmail' && id) {
+      const oid = toObjectId(id, res);
+      if (!oid) return;
+      const film = await col.findOne({ _id: oid });
+      if (!film) return res.status(404).json({ error: 'Not found' });
+      if (!film.email) {
+        return res.status(400).json({ error: 'Missing email on film record' });
+      }
+      const review = typeof film.review === 'string' && film.review.trim()
+        ? film.review
+        : generateReview(film);
+
+      const webhook = await callAppsScriptApproveWebhook(film, review);
+      if (!webhook.ok) {
+        return res.status(webhook.status || 502).json({ error: webhook.error || 'Acceptance email webhook failed' });
+      }
+      if (webhook.data && webhook.data.success === false) {
+        return res.status(400).json({ error: webhook.data.error || 'Acceptance email webhook failed' });
+      }
+
+      if (!film.review && review) {
+        await col.updateOne({ _id: oid }, { $set: { review } });
+      }
       return res.status(200).json({ success: true });
     }
 
