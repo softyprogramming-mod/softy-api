@@ -149,8 +149,6 @@ export default async function handler(req, res) {
       }
 
       const cleanFilm = { ...film };
-      delete cleanFilm.password;
-      delete cleanFilm.email;
       delete cleanFilm.website;
       delete cleanFilm.honeypot;
       cleanFilm.timestamp = cleanFilm.timestamp || new Date().toISOString();

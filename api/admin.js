@@ -446,6 +446,10 @@ export default async function handler(req, res) {
       if (!film.pending) {
         return res.status(400).json({ error: 'Approve action is only for pending submissions' });
       }
+      const emailOverride = String(req.body?.email || '').trim();
+      if (!film.email && emailOverride) {
+        film.email = emailOverride;
+      }
       if (!film.email) {
         return res.status(400).json({ error: 'Missing email on pending record' });
       }
@@ -476,6 +480,7 @@ export default async function handler(req, res) {
         {
           $set: {
             review,
+            email: film.email,
             pending: false,
             live: true,
             accepted: true,
