@@ -441,6 +441,7 @@ export default async function handler(req, res) {
       const oid = toObjectId(id, res);
       if (!oid) return;
       const review = typeof req.body?.review === 'string' ? req.body.review : '';
+      const skipEmail = req.body?.skipEmail === true;
       const film = await col.findOne({ _id: oid });
       if (!film) return res.status(404).json({ error: 'Not found' });
       if (!film.pending) {
@@ -450,16 +451,18 @@ export default async function handler(req, res) {
       if (!film.email && emailOverride) {
         film.email = emailOverride;
       }
-      if (!film.email) {
+      if (!skipEmail && !film.email) {
         return res.status(400).json({ error: 'Missing email on pending record' });
       }
 
-      const webhook = await callAppsScriptApproveWebhook(film, review);
-      if (!webhook.ok) {
-        return res.status(webhook.status || 502).json({ error: webhook.error || 'Approve webhook failed' });
-      }
-      if (webhook.data && webhook.data.success === false) {
-        return res.status(400).json({ error: webhook.data.error || 'Approve webhook failed' });
+      if (!skipEmail) {
+        const webhook = await callAppsScriptApproveWebhook(film, review);
+        if (!webhook.ok) {
+          return res.status(webhook.status || 502).json({ error: webhook.error || 'Approve webhook failed' });
+        }
+        if (webhook.data && webhook.data.success === false) {
+          return res.status(400).json({ error: webhook.data.error || 'Approve webhook failed' });
+        }
       }
 
       // New approvals should become the top hero film by default.
@@ -475,18 +478,20 @@ export default async function handler(req, res) {
           ? currentTop[0].sortOrder - 1
           : 0;
 
+      const approveFields = {
+        review,
+        pending: false,
+        live: true,
+        accepted: true,
+        sortOrder: nextTopSortOrder,
+        rejectionArcActive: false
+      };
+      if (film.email) approveFields.email = film.email;
+
       const updateRes = await col.updateOne(
         { _id: oid, pending: true },
         {
-          $set: {
-            review,
-            email: film.email,
-            pending: false,
-            live: true,
-            accepted: true,
-            sortOrder: nextTopSortOrder,
-            rejectionArcActive: false
-          },
+          $set: approveFields,
           $unset: {
             rejectionArcId: '',
             rejectionArcStartedAt: '',
