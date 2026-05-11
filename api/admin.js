@@ -222,6 +222,94 @@ async function publishInstagramImage({ imageUrl, caption }) {
   };
 }
 
+function normalizeInstagramManualImageUrls(value) {
+  const values = Array.isArray(value)
+    ? value
+    : String(value || '').split(/[\n,]+/);
+  const seen = new Set();
+  const urls = [];
+  values.forEach(item => {
+    const url = String(item || '').trim();
+    if (!url || seen.has(url)) return;
+    if (!/^https:\/\//i.test(url)) return;
+    seen.add(url);
+    urls.push(url);
+  });
+  return urls.slice(0, 9);
+}
+
+async function publishInstagramImages({ imageUrls, caption }) {
+  const urls = (Array.isArray(imageUrls) ? imageUrls : []).map(v => String(v || '').trim()).filter(Boolean);
+  if (!urls.length) {
+    const err = new Error('Missing Instagram image URL');
+    err.status = 400;
+    throw err;
+  }
+  if (urls.length === 1) {
+    return publishInstagramImage({ imageUrl: urls[0], caption });
+  }
+
+  const config = getMetaConfig();
+  if (!config.ok) {
+    const err = new Error(config.error);
+    err.status = 500;
+    throw err;
+  }
+
+  const children = [];
+  for (const url of urls.slice(0, 10)) {
+    const itemBody = new URLSearchParams();
+    itemBody.set('image_url', url);
+    itemBody.set('is_carousel_item', 'true');
+    itemBody.set('access_token', config.accessToken);
+
+    const itemRes = await fetch(`${getMetaGraphBase()}/${encodeURIComponent(config.igUserId)}/media`, {
+      method: 'POST',
+      body: itemBody
+    });
+    const itemData = await readMetaJson(itemRes);
+    if (!itemData.id) {
+      const err = new Error('Meta did not return a carousel item id.');
+      err.status = 502;
+      throw err;
+    }
+    children.push(String(itemData.id));
+  }
+
+  const carouselBody = new URLSearchParams();
+  carouselBody.set('media_type', 'CAROUSEL');
+  carouselBody.set('children', children.join(','));
+  carouselBody.set('caption', caption);
+  carouselBody.set('access_token', config.accessToken);
+
+  const carouselRes = await fetch(`${getMetaGraphBase()}/${encodeURIComponent(config.igUserId)}/media`, {
+    method: 'POST',
+    body: carouselBody
+  });
+  const carouselData = await readMetaJson(carouselRes);
+  const creationId = String(carouselData.id || '');
+  if (!creationId) {
+    const err = new Error('Meta did not return an Instagram carousel creation id.');
+    err.status = 502;
+    throw err;
+  }
+
+  const publishBody = new URLSearchParams();
+  publishBody.set('creation_id', creationId);
+  publishBody.set('access_token', config.accessToken);
+
+  const publishRes = await fetch(`${getMetaGraphBase()}/${encodeURIComponent(config.igUserId)}/media_publish`, {
+    method: 'POST',
+    body: publishBody
+  });
+  const publishData = await readMetaJson(publishRes);
+  return {
+    creationId,
+    postId: String(publishData.id || ''),
+    carouselItemIds: children
+  };
+}
+
 async function fetchImageBuffer(url, label) {
   const imageRes = await fetch(url);
   if (!imageRes.ok) {
@@ -923,8 +1011,20 @@ export default async function handler(req, res) {
         return res.status(400).json({ error: 'Missing Instagram caption' });
       }
 
-      const instagramImageUrl = await createAndUploadLaurelPostImage(film, imageUrl);
-      const posted = await publishInstagramImage({ imageUrl: instagramImageUrl, caption });
+      const includeGeneratedLaurel = req.body?.includeGeneratedLaurel !== false;
+      const manualImageUrls = normalizeInstagramManualImageUrls(req.body?.manualImageUrls);
+      const postImageUrls = [];
+      let instagramImageUrl = '';
+      if (includeGeneratedLaurel) {
+        instagramImageUrl = await createAndUploadLaurelPostImage(film, imageUrl);
+        postImageUrls.push(instagramImageUrl);
+      }
+      postImageUrls.push(...manualImageUrls);
+      if (!postImageUrls.length) {
+        return res.status(400).json({ error: 'Choose the generated laurel image or add at least one public HTTPS image URL' });
+      }
+
+      const posted = await publishInstagramImages({ imageUrls: postImageUrls, caption });
       const postedAt = new Date().toISOString();
       await col.updateOne(
         { _id: oid },
@@ -933,8 +1033,12 @@ export default async function handler(req, res) {
             instagramPostedAt: postedAt,
             instagramPostId: posted.postId,
             instagramPostCaption: caption,
-            instagramPostImageUrl: instagramImageUrl,
-            instagramSourceImageUrl: imageUrl
+            instagramPostImageUrl: postImageUrls[0],
+            instagramPostImageUrls: postImageUrls,
+            instagramSourceImageUrl: imageUrl,
+            instagramManualImageUrls: manualImageUrls,
+            instagramGeneratedLaurelIncluded: includeGeneratedLaurel,
+            instagramPostType: postImageUrls.length > 1 ? 'carousel' : 'image'
           },
           $unset: { instagramPostError: '' }
         }
@@ -946,8 +1050,10 @@ export default async function handler(req, res) {
         instagramCreationId: posted.creationId,
         instagramPostedAt: postedAt,
         caption,
-        imageUrl: instagramImageUrl,
-        sourceImageUrl: imageUrl
+        imageUrl: postImageUrls[0],
+        imageUrls: postImageUrls,
+        sourceImageUrl: imageUrl,
+        postType: postImageUrls.length > 1 ? 'carousel' : 'image'
       });
     }
 
