@@ -29,7 +29,9 @@ const ALLOWED_UPDATE_FIELDS = new Set([
   'title', 'director', 'writer', 'producer', 'genre', 'runtime',
   'logline', 'directorStatement', 'filmLink', 'thumbnail', 'slug',
   'review', 'twitter', 'onlinePremiere', 'completionDate', 'cast', 'language',
-  'pending', 'live', 'accepted', 'timestamp', 'sortOrder'
+  'pending', 'live', 'accepted', 'timestamp', 'sortOrder',
+  'autoPaused', 'autoPausedAt', 'autoPauseRemainingMs', 'scheduledDecisionAt',
+  'autoResumedAt'
 ]);
 
 const ARC_DELAY_UNITS = new Set(['minutes', 'hours', 'days']);
@@ -275,6 +277,21 @@ async function callAppsScriptApproveWebhook(film, review) {
   });
 }
 
+async function callAppsScriptPauseWebhook(submissionId, scheduledDecisionAt) {
+  return callAppsScriptWebhook({
+    action: 'pauseSubmission',
+    submissionId,
+    scheduledDecisionAt: scheduledDecisionAt || ''
+  });
+}
+
+async function callAppsScriptResumeWebhook(submissionId) {
+  return callAppsScriptWebhook({
+    action: 'resumeSubmission',
+    submissionId
+  });
+}
+
 export default async function handler(req, res) {
   applyCors(req, res);
   res.setHeader('Cache-Control', 'no-store');
@@ -369,6 +386,83 @@ export default async function handler(req, res) {
         );
       }
       return res.status(200).json({ success: true, result: webhook.data || {} });
+    }
+
+    if (req.method === 'POST' && action === 'pauseSubmission' && id) {
+      const oid = toObjectId(id, res);
+      if (!oid) return;
+      const film = await col.findOne({ _id: oid });
+      if (!film) return res.status(404).json({ error: 'Not found' });
+      if (film.pending !== true) {
+        return res.status(400).json({ error: 'Only pending submissions can be paused' });
+      }
+      if (film.autoPaused === true) {
+        return res.status(200).json({ success: true, alreadyPaused: true, film });
+      }
+      const submissionId = String(film.submissionId || '').trim();
+      if (!submissionId) {
+        return res.status(400).json({ error: 'Missing submissionId on pending record' });
+      }
+
+      const webhook = await callAppsScriptPauseWebhook(submissionId, film.scheduledDecisionAt || '');
+      if (!webhook.ok || (webhook.data && webhook.data.success === false)) {
+        return res.status(webhook.status || 502).json({
+          error: (webhook.data && webhook.data.error) || webhook.error || 'Pause webhook failed'
+        });
+      }
+      const result = webhook.data || {};
+      const pausedAt = result.pausedAt || new Date().toISOString();
+      const remainingMs = Number(result.remainingMs || 0);
+      await col.updateOne(
+        { _id: oid, pending: true },
+        {
+          $set: {
+            autoPaused: true,
+            autoPausedAt: pausedAt,
+            autoPauseRemainingMs: remainingMs
+          }
+        }
+      );
+      const updated = await col.findOne({ _id: oid });
+      return res.status(200).json({ success: true, film: updated, result });
+    }
+
+    if (req.method === 'POST' && action === 'resumeSubmission' && id) {
+      const oid = toObjectId(id, res);
+      if (!oid) return;
+      const film = await col.findOne({ _id: oid });
+      if (!film) return res.status(404).json({ error: 'Not found' });
+      if (film.pending !== true) {
+        return res.status(400).json({ error: 'Only pending submissions can be resumed' });
+      }
+      const submissionId = String(film.submissionId || '').trim();
+      if (!submissionId) {
+        return res.status(400).json({ error: 'Missing submissionId on pending record' });
+      }
+
+      const webhook = await callAppsScriptResumeWebhook(submissionId);
+      if (!webhook.ok || (webhook.data && webhook.data.success === false)) {
+        return res.status(webhook.status || 502).json({
+          error: (webhook.data && webhook.data.error) || webhook.error || 'Resume webhook failed'
+        });
+      }
+      const result = webhook.data || {};
+      await col.updateOne(
+        { _id: oid, pending: true },
+        {
+          $set: {
+            autoPaused: false,
+            autoResumedAt: new Date().toISOString(),
+            scheduledDecisionAt: result.scheduledDecisionAt || ''
+          },
+          $unset: {
+            autoPausedAt: '',
+            autoPauseRemainingMs: ''
+          }
+        }
+      );
+      const updated = await col.findOne({ _id: oid });
+      return res.status(200).json({ success: true, film: updated, result });
     }
 
     if (req.method === 'POST' && action === 'reorder') {
