@@ -17,6 +17,7 @@ import clientPromise from '../lib/mongodb.js';
 import { generateReview } from '../lib/review-generator.js';
 import { ObjectId } from 'mongodb';
 import crypto from 'crypto';
+import sharp from 'sharp';
 
 const DB_NAME = 'shortsoftheyear';
 const COLLECTION = 'films';
@@ -34,7 +35,7 @@ const ALLOWED_UPDATE_FIELDS = new Set([
   'pending', 'live', 'accepted', 'timestamp', 'sortOrder',
   'autoPaused', 'autoPausedAt', 'autoPauseRemainingMs', 'scheduledDecisionAt',
   'autoResumedAt', 'instagramPostedAt', 'instagramPostId', 'instagramPostCaption',
-  'instagramPostImageUrl'
+  'instagramPostImageUrl', 'instagramSourceImageUrl'
 ]);
 
 const ARC_DELAY_UNITS = new Set(['minutes', 'hours', 'days']);
@@ -91,6 +92,16 @@ function getPublicSiteUrl() {
   return String(process.env.PUBLIC_SITE_URL || 'https://www.shortsoftheyear.com').replace(/\/+$/, '');
 }
 
+function slugifyForPath(value) {
+  return String(value || '')
+    .toLowerCase()
+    .trim()
+    .replace(/['"]/g, '')
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 80) || 'film';
+}
+
 function buildInstagramCaption(film, overrideCaption = '') {
   const override = cleanText(overrideCaption, 2200).trim();
   if (override) return override;
@@ -119,6 +130,31 @@ function getInstagramImageUrl(film) {
 function getMetaGraphBase() {
   const version = String(process.env.META_GRAPH_VERSION || 'v25.0').replace(/^\/+|\/+$/g, '');
   return `https://graph.facebook.com/${version}`;
+}
+
+function getGithubImageConfig() {
+  const token = String(process.env.GITHUB_TOKEN || process.env.GITHUB_PAT || '').trim();
+  const repo = String(
+    process.env.INSTAGRAM_IMAGE_REPO ||
+    process.env.GITHUB_IMAGE_REPO ||
+    'softyprogramming-mod/Shorts-of-the-Year-website'
+  ).trim();
+  const branch = String(process.env.INSTAGRAM_IMAGE_BRANCH || process.env.GITHUB_IMAGE_BRANCH || 'main').trim();
+  const laurelUrl = String(
+    process.env.SOFTY_LAUREL_WHITE_URL ||
+    `https://raw.githubusercontent.com/${repo}/${branch}/images/softy-laurel-white.png`
+  ).trim();
+
+  if (!token) {
+    return {
+      ok: false,
+      error: 'Laurel image generation needs GITHUB_TOKEN or GITHUB_PAT set in Vercel.'
+    };
+  }
+  if (!/^[^/]+\/[^/]+$/.test(repo)) {
+    return { ok: false, error: 'INSTAGRAM_IMAGE_REPO must look like owner/repo.' };
+  }
+  return { ok: true, token, repo, branch, laurelUrl };
 }
 
 function getMetaConfig() {
@@ -184,6 +220,106 @@ async function publishInstagramImage({ imageUrl, caption }) {
     creationId,
     postId: String(publishData.id || '')
   };
+}
+
+async function fetchImageBuffer(url, label) {
+  const imageRes = await fetch(url);
+  if (!imageRes.ok) {
+    const err = new Error(`Could not download ${label || 'image'} (${imageRes.status})`);
+    err.status = 502;
+    throw err;
+  }
+  const contentType = String(imageRes.headers.get('content-type') || '').toLowerCase();
+  if (contentType && !contentType.startsWith('image/')) {
+    const err = new Error(`${label || 'Image'} URL did not return an image`);
+    err.status = 400;
+    throw err;
+  }
+  return Buffer.from(await imageRes.arrayBuffer());
+}
+
+async function createLaurelPostImageBuffer(sourceImageUrl, laurelUrl) {
+  const [sourceBuffer, laurelBuffer] = await Promise.all([
+    fetchImageBuffer(sourceImageUrl, 'film thumbnail'),
+    fetchImageBuffer(laurelUrl, 'white laurel')
+  ]);
+
+  const size = 1080;
+  const base = await sharp(sourceBuffer)
+    .resize(size, size, { fit: 'cover', position: 'centre' })
+    .modulate({ brightness: 0.9 })
+    .png()
+    .toBuffer();
+
+  const laurelSize = Math.round(size * 0.42);
+  const laurel = await sharp(laurelBuffer)
+    .resize(laurelSize, laurelSize, { fit: 'inside' })
+    .png()
+    .toBuffer();
+
+  return sharp({
+    create: {
+      width: size,
+      height: size,
+      channels: 4,
+      background: '#000000'
+    }
+  })
+    .composite([
+      { input: base, left: 0, top: 0 },
+      { input: laurel, left: Math.round((size - laurelSize) / 2), top: Math.round(size * 0.07) }
+    ])
+    .jpeg({ quality: 92, mozjpeg: true })
+    .toBuffer();
+}
+
+async function uploadInstagramImageToGithub({ film, imageBuffer }) {
+  const config = getGithubImageConfig();
+  if (!config.ok) {
+    const err = new Error(config.error);
+    err.status = 500;
+    throw err;
+  }
+
+  const slug = slugifyForPath(film?.slug || film?.title);
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const path = `instagram-posts/${slug}-${stamp}.jpg`;
+  const putRes = await fetch(`https://api.github.com/repos/${config.repo}/contents/${encodeURIComponent(path).replace(/%2F/g, '/')}`, {
+    method: 'PUT',
+    headers: {
+      'Authorization': `Bearer ${config.token}`,
+      'Accept': 'application/vnd.github+json',
+      'Content-Type': 'application/json',
+      'X-GitHub-Api-Version': '2022-11-28',
+      'User-Agent': 'softy-api'
+    },
+    body: JSON.stringify({
+      message: `Add Instagram post image for ${film?.title || 'film'}`,
+      content: imageBuffer.toString('base64'),
+      branch: config.branch
+    })
+  });
+
+  let data = null;
+  try { data = await putRes.json(); } catch (_) {}
+  if (!putRes.ok) {
+    const err = new Error(data?.message || `GitHub image upload failed with HTTP ${putRes.status}`);
+    err.status = putRes.status || 502;
+    throw err;
+  }
+
+  return `https://raw.githubusercontent.com/${config.repo}/${config.branch}/${path}`;
+}
+
+async function createAndUploadLaurelPostImage(film, sourceImageUrl) {
+  const config = getGithubImageConfig();
+  if (!config.ok) {
+    const err = new Error(config.error);
+    err.status = 500;
+    throw err;
+  }
+  const imageBuffer = await createLaurelPostImageBuffer(sourceImageUrl, config.laurelUrl);
+  return uploadInstagramImageToGithub({ film, imageBuffer });
 }
 
 function normalizeRejectionArcStep(raw, index) {
@@ -761,6 +897,7 @@ export default async function handler(req, res) {
       return res.status(200).json({
         caption: buildInstagramCaption(film),
         imageUrl,
+        willGenerateLaurelImage: true,
         siteUrl: getPublicSiteUrl(),
         alreadyPostedAt: film.instagramPostedAt || '',
         instagramPostId: film.instagramPostId || ''
@@ -786,7 +923,8 @@ export default async function handler(req, res) {
         return res.status(400).json({ error: 'Missing Instagram caption' });
       }
 
-      const posted = await publishInstagramImage({ imageUrl, caption });
+      const instagramImageUrl = await createAndUploadLaurelPostImage(film, imageUrl);
+      const posted = await publishInstagramImage({ imageUrl: instagramImageUrl, caption });
       const postedAt = new Date().toISOString();
       await col.updateOne(
         { _id: oid },
@@ -795,7 +933,8 @@ export default async function handler(req, res) {
             instagramPostedAt: postedAt,
             instagramPostId: posted.postId,
             instagramPostCaption: caption,
-            instagramPostImageUrl: imageUrl
+            instagramPostImageUrl: instagramImageUrl,
+            instagramSourceImageUrl: imageUrl
           },
           $unset: { instagramPostError: '' }
         }
@@ -807,7 +946,8 @@ export default async function handler(req, res) {
         instagramCreationId: posted.creationId,
         instagramPostedAt: postedAt,
         caption,
-        imageUrl
+        imageUrl: instagramImageUrl,
+        sourceImageUrl: imageUrl
       });
     }
 
