@@ -7,6 +7,8 @@
 // PUT    /api/admin?action=update&id=xxx   → edit a film
 // PUT    /api/admin?action=approve&id=xxx  → approve pending submission + set review
 // POST   /api/admin?action=sendAcceptanceEmail&id=xxx → resend acceptance email
+// GET    /api/admin?action=instagramPreview&id=xxx → preview Instagram caption/image
+// POST   /api/admin?action=postInstagram&id=xxx → publish film post to Instagram
 // DELETE /api/admin?action=reject&id=xxx   → reject pending submission + send rejection email
 // DELETE /api/admin?action=delete&id=xxx   → delete a film
 // PUT    /api/admin?action=toggle&id=xxx   → toggle live/hidden
@@ -31,7 +33,8 @@ const ALLOWED_UPDATE_FIELDS = new Set([
   'review', 'twitter', 'onlinePremiere', 'completionDate', 'cast', 'language',
   'pending', 'live', 'accepted', 'timestamp', 'sortOrder',
   'autoPaused', 'autoPausedAt', 'autoPauseRemainingMs', 'scheduledDecisionAt',
-  'autoResumedAt'
+  'autoResumedAt', 'instagramPostedAt', 'instagramPostId', 'instagramPostCaption',
+  'instagramPostImageUrl'
 ]);
 
 const ARC_DELAY_UNITS = new Set(['minutes', 'hours', 'days']);
@@ -65,6 +68,122 @@ function clampInt(value, fallback, min, max) {
 
 function cleanText(value, maxLen = 1000) {
   return String(value == null ? '' : value).replace(/\r\n/g, '\n').slice(0, maxLen);
+}
+
+function normalizeInstagramHandle(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return '';
+  const first = raw.split(/[,\s]+/).find(Boolean) || '';
+  if (!first) return '';
+  if (/^https?:\/\//i.test(first)) {
+    try {
+      const parsed = new URL(first);
+      if (/instagram\.com$/i.test(parsed.hostname.replace(/^www\./i, ''))) {
+        const segment = parsed.pathname.split('/').filter(Boolean)[0] || '';
+        return segment ? '@' + segment.replace(/^@+/, '') : '';
+      }
+    } catch (_) {}
+  }
+  return '@' + first.replace(/^@+/, '').replace(/[^A-Za-z0-9._]/g, '');
+}
+
+function getPublicSiteUrl() {
+  return String(process.env.PUBLIC_SITE_URL || 'https://www.shortsoftheyear.com').replace(/\/+$/, '');
+}
+
+function buildInstagramCaption(film, overrideCaption = '') {
+  const override = cleanText(overrideCaption, 2200).trim();
+  if (override) return override;
+
+  const review = cleanText(film?.review || '', 1600).trim();
+  const title = cleanText(film?.title || 'Untitled', 180).trim();
+  const director = cleanText(film?.director || 'the filmmaker', 180).trim();
+  const handle = normalizeInstagramHandle(film?.instagram || film?.twitter || '');
+  const credit = `${title} by ${director}${handle ? ` (${handle})` : ''}`;
+  const caption = [
+    review || credit,
+    review ? credit : '',
+    'Now playing on ShortsOfTheYear.com'
+  ].filter(Boolean).join('\n\n');
+
+  return cleanText(caption, 2200).trim();
+}
+
+function getInstagramImageUrl(film) {
+  const url = String(film?.thumbnail || '').trim();
+  if (!url || !/^https:\/\//i.test(url)) return '';
+  if (/\/placeholder\.jpe?g(?:$|\?)/i.test(url)) return '';
+  return url;
+}
+
+function getMetaGraphBase() {
+  const version = String(process.env.META_GRAPH_VERSION || 'v25.0').replace(/^\/+|\/+$/g, '');
+  return `https://graph.facebook.com/${version}`;
+}
+
+function getMetaConfig() {
+  const accessToken = String(process.env.META_ACCESS_TOKEN || '').trim();
+  const igUserId = String(process.env.META_IG_USER_ID || '').trim();
+  if (!accessToken || !igUserId) {
+    return {
+      ok: false,
+      error: 'Instagram posting is not configured. Set META_ACCESS_TOKEN and META_IG_USER_ID in Vercel.'
+    };
+  }
+  return { ok: true, accessToken, igUserId };
+}
+
+async function readMetaJson(metaRes) {
+  let data = null;
+  try { data = await metaRes.json(); } catch (_) {}
+  if (!metaRes.ok || data?.error) {
+    const metaMessage = data?.error?.message || data?.error?.error_user_msg || `Meta API failed with HTTP ${metaRes.status}`;
+    const err = new Error(metaMessage);
+    err.status = metaRes.status || 502;
+    err.meta = data?.error || data || null;
+    throw err;
+  }
+  return data || {};
+}
+
+async function publishInstagramImage({ imageUrl, caption }) {
+  const config = getMetaConfig();
+  if (!config.ok) {
+    const err = new Error(config.error);
+    err.status = 500;
+    throw err;
+  }
+
+  const createBody = new URLSearchParams();
+  createBody.set('image_url', imageUrl);
+  createBody.set('caption', caption);
+  createBody.set('access_token', config.accessToken);
+
+  const createRes = await fetch(`${getMetaGraphBase()}/${encodeURIComponent(config.igUserId)}/media`, {
+    method: 'POST',
+    body: createBody
+  });
+  const createData = await readMetaJson(createRes);
+  const creationId = String(createData.id || '');
+  if (!creationId) {
+    const err = new Error('Meta did not return an Instagram creation id.');
+    err.status = 502;
+    throw err;
+  }
+
+  const publishBody = new URLSearchParams();
+  publishBody.set('creation_id', creationId);
+  publishBody.set('access_token', config.accessToken);
+
+  const publishRes = await fetch(`${getMetaGraphBase()}/${encodeURIComponent(config.igUserId)}/media_publish`, {
+    method: 'POST',
+    body: publishBody
+  });
+  const publishData = await readMetaJson(publishRes);
+  return {
+    creationId,
+    postId: String(publishData.id || '')
+  };
 }
 
 function normalizeRejectionArcStep(raw, index) {
@@ -624,6 +743,72 @@ export default async function handler(req, res) {
         await col.updateOne({ _id: oid }, { $set: { review } });
       }
       return res.status(200).json({ success: true });
+    }
+
+    // ── PREVIEW Instagram post copy/image ──────────────────────
+    if (req.method === 'GET' && action === 'instagramPreview' && id) {
+      const oid = toObjectId(id, res);
+      if (!oid) return;
+      const film = await col.findOne({ _id: oid });
+      if (!film) return res.status(404).json({ error: 'Not found' });
+      if (film.pending === true) {
+        return res.status(400).json({ error: 'Only accepted films can be posted to Instagram' });
+      }
+      const imageUrl = getInstagramImageUrl(film);
+      if (!imageUrl) {
+        return res.status(400).json({ error: 'Film needs a real public HTTPS thumbnail before posting' });
+      }
+      return res.status(200).json({
+        caption: buildInstagramCaption(film),
+        imageUrl,
+        siteUrl: getPublicSiteUrl(),
+        alreadyPostedAt: film.instagramPostedAt || '',
+        instagramPostId: film.instagramPostId || ''
+      });
+    }
+
+    // ── PUBLISH a film post to Instagram ───────────────────────
+    if (req.method === 'POST' && action === 'postInstagram' && id) {
+      const oid = toObjectId(id, res);
+      if (!oid) return;
+      const film = await col.findOne({ _id: oid });
+      if (!film) return res.status(404).json({ error: 'Not found' });
+      if (film.pending === true) {
+        return res.status(400).json({ error: 'Only accepted films can be posted to Instagram' });
+      }
+      const imageUrl = getInstagramImageUrl(film);
+      if (!imageUrl) {
+        return res.status(400).json({ error: 'Film needs a real public HTTPS thumbnail before posting' });
+      }
+      const captionOverride = typeof req.body?.caption === 'string' ? req.body.caption : '';
+      const caption = buildInstagramCaption(film, captionOverride);
+      if (!caption) {
+        return res.status(400).json({ error: 'Missing Instagram caption' });
+      }
+
+      const posted = await publishInstagramImage({ imageUrl, caption });
+      const postedAt = new Date().toISOString();
+      await col.updateOne(
+        { _id: oid },
+        {
+          $set: {
+            instagramPostedAt: postedAt,
+            instagramPostId: posted.postId,
+            instagramPostCaption: caption,
+            instagramPostImageUrl: imageUrl
+          },
+          $unset: { instagramPostError: '' }
+        }
+      );
+
+      return res.status(200).json({
+        success: true,
+        instagramPostId: posted.postId,
+        instagramCreationId: posted.creationId,
+        instagramPostedAt: postedAt,
+        caption,
+        imageUrl
+      });
     }
 
     // ── TOGGLE live / hidden ────────────────────────────────────
