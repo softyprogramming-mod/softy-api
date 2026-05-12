@@ -8,6 +8,7 @@
 // PUT    /api/admin?action=approve&id=xxx  → approve pending submission + set review
 // POST   /api/admin?action=sendAcceptanceEmail&id=xxx → resend acceptance email
 // GET    /api/admin?action=instagramPreview&id=xxx → preview Instagram caption/image
+// POST   /api/admin?action=uploadInstagramImages&id=xxx → upload manual Instagram post images
 // POST   /api/admin?action=postInstagram&id=xxx → publish film post to Instagram
 // DELETE /api/admin?action=reject&id=xxx   → reject pending submission + send rejection email
 // DELETE /api/admin?action=delete&id=xxx   → delete a film
@@ -28,6 +29,14 @@ const RATE_LIMIT_MAX = 120;
 const rateState = globalThis.__softyAdminRateState || new Map();
 globalThis.__softyAdminRateState = rateState;
 
+export const config = {
+  api: {
+    bodyParser: {
+      sizeLimit: '15mb'
+    }
+  }
+};
+
 const ALLOWED_UPDATE_FIELDS = new Set([
   'title', 'director', 'writer', 'producer', 'genre', 'runtime',
   'logline', 'directorStatement', 'filmLink', 'thumbnail', 'slug',
@@ -35,7 +44,8 @@ const ALLOWED_UPDATE_FIELDS = new Set([
   'pending', 'live', 'accepted', 'timestamp', 'sortOrder',
   'autoPaused', 'autoPausedAt', 'autoPauseRemainingMs', 'scheduledDecisionAt',
   'autoResumedAt', 'instagramPostedAt', 'instagramPostId', 'instagramPostCaption',
-  'instagramPostImageUrl', 'instagramSourceImageUrl'
+  'instagramPostImageUrl', 'instagramPostImageUrls', 'instagramSourceImageUrl',
+  'instagramManualImageUrls', 'instagramGeneratedLaurelIncluded', 'instagramPostType'
 ]);
 
 const ARC_DELAY_UNITS = new Set(['minutes', 'hours', 'days']);
@@ -235,7 +245,46 @@ function normalizeInstagramManualImageUrls(value) {
     seen.add(url);
     urls.push(url);
   });
-  return urls.slice(0, 9);
+  return urls.slice(0, 10);
+}
+
+function normalizeInstagramUploadImages(value) {
+  const incoming = Array.isArray(value) ? value : [];
+  const images = [];
+  for (const item of incoming) {
+    if (!item || typeof item !== 'object') continue;
+    const name = cleanText(item.name || 'image.jpg', 180).trim() || 'image.jpg';
+    const mimeType = cleanText(item.mimeType || item.type || '', 80).toLowerCase();
+    const dataUrl = String(item.dataUrl || item.data || '').trim();
+    let base64 = String(item.base64 || '').trim();
+    let inferredType = mimeType;
+
+    if (dataUrl) {
+      const match = dataUrl.match(/^data:(image\/(?:jpeg|jpg|png|webp));base64,([A-Za-z0-9+/=]+)$/i);
+      if (!match) continue;
+      inferredType = match[1].toLowerCase().replace('image/jpg', 'image/jpeg');
+      base64 = match[2];
+    }
+
+    inferredType = inferredType.replace('image/jpg', 'image/jpeg');
+    if (!['image/jpeg', 'image/png', 'image/webp'].includes(inferredType)) continue;
+    if (!base64 || !/^[A-Za-z0-9+/=]+$/.test(base64)) continue;
+    images.push({ name, mimeType: inferredType, base64 });
+  }
+  return images.slice(0, 10);
+}
+
+async function normalizeManualInstagramUploadBuffer(upload) {
+  const raw = Buffer.from(upload.base64, 'base64');
+  if (!raw.length || raw.length > 12 * 1024 * 1024) {
+    const err = new Error('Each uploaded image must be under 12 MB.');
+    err.status = 400;
+    throw err;
+  }
+  return sharp(raw)
+    .resize(1080, 1080, { fit: 'cover', position: 'centre' })
+    .jpeg({ quality: 92, mozjpeg: true })
+    .toBuffer();
 }
 
 async function publishInstagramImages({ imageUrls, caption }) {
@@ -383,6 +432,44 @@ async function uploadInstagramImageToGithub({ film, imageBuffer }) {
     },
     body: JSON.stringify({
       message: `Add Instagram post image for ${film?.title || 'film'}`,
+      content: imageBuffer.toString('base64'),
+      branch: config.branch
+    })
+  });
+
+  let data = null;
+  try { data = await putRes.json(); } catch (_) {}
+  if (!putRes.ok) {
+    const err = new Error(data?.message || `GitHub image upload failed with HTTP ${putRes.status}`);
+    err.status = putRes.status || 502;
+    throw err;
+  }
+
+  return `https://raw.githubusercontent.com/${config.repo}/${config.branch}/${path}`;
+}
+
+async function uploadManualInstagramImageToGithub({ film, imageBuffer, index }) {
+  const config = getGithubImageConfig();
+  if (!config.ok) {
+    const err = new Error(config.error);
+    err.status = 500;
+    throw err;
+  }
+
+  const slug = slugifyForPath(film?.slug || film?.title);
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const path = `instagram-posts/manual/${slug}-${stamp}-${index + 1}.jpg`;
+  const putRes = await fetch(`https://api.github.com/repos/${config.repo}/contents/${encodeURIComponent(path).replace(/%2F/g, '/')}`, {
+    method: 'PUT',
+    headers: {
+      'Authorization': `Bearer ${config.token}`,
+      'Accept': 'application/vnd.github+json',
+      'Content-Type': 'application/json',
+      'X-GitHub-Api-Version': '2022-11-28',
+      'User-Agent': 'softy-api'
+    },
+    body: JSON.stringify({
+      message: `Add manual Instagram image for ${film?.title || 'film'}`,
       content: imageBuffer.toString('base64'),
       branch: config.branch
     })
@@ -992,6 +1079,38 @@ export default async function handler(req, res) {
       });
     }
 
+    // ── UPLOAD manual images for an Instagram post ──────────────
+    if (req.method === 'POST' && action === 'uploadInstagramImages' && id) {
+      const oid = toObjectId(id, res);
+      if (!oid) return;
+      const film = await col.findOne({ _id: oid });
+      if (!film) return res.status(404).json({ error: 'Not found' });
+      if (film.pending === true) {
+        return res.status(400).json({ error: 'Only accepted films can use Instagram image upload' });
+      }
+
+      const uploads = normalizeInstagramUploadImages(req.body?.images);
+      if (!uploads.length) {
+        return res.status(400).json({ error: 'Choose at least one JPG, PNG, or WebP image.' });
+      }
+
+      const uploaded = [];
+      for (let i = 0; i < uploads.length; i += 1) {
+        const imageBuffer = await normalizeManualInstagramUploadBuffer(uploads[i]);
+        const url = await uploadManualInstagramImageToGithub({ film, imageBuffer, index: i });
+        uploaded.push({
+          url,
+          name: uploads[i].name
+        });
+      }
+
+      return res.status(200).json({
+        success: true,
+        images: uploaded,
+        imageUrls: uploaded.map(img => img.url)
+      });
+    }
+
     // ── PUBLISH a film post to Instagram ───────────────────────
     if (req.method === 'POST' && action === 'postInstagram' && id) {
       const oid = toObjectId(id, res);
@@ -1001,10 +1120,6 @@ export default async function handler(req, res) {
       if (film.pending === true) {
         return res.status(400).json({ error: 'Only accepted films can be posted to Instagram' });
       }
-      const imageUrl = getInstagramImageUrl(film);
-      if (!imageUrl) {
-        return res.status(400).json({ error: 'Film needs a real public HTTPS thumbnail before posting' });
-      }
       const captionOverride = typeof req.body?.caption === 'string' ? req.body.caption : '';
       const caption = buildInstagramCaption(film, captionOverride);
       if (!caption) {
@@ -1012,7 +1127,11 @@ export default async function handler(req, res) {
       }
 
       const includeGeneratedLaurel = req.body?.includeGeneratedLaurel !== false;
-      const manualImageUrls = normalizeInstagramManualImageUrls(req.body?.manualImageUrls);
+      const manualImageUrls = normalizeInstagramManualImageUrls(req.body?.manualImageUrls).slice(0, includeGeneratedLaurel ? 9 : 10);
+      const imageUrl = getInstagramImageUrl(film);
+      if (includeGeneratedLaurel && !imageUrl) {
+        return res.status(400).json({ error: 'Film needs a real public HTTPS thumbnail before using the generated laurel image' });
+      }
       const postImageUrls = [];
       let instagramImageUrl = '';
       if (includeGeneratedLaurel) {
@@ -1151,6 +1270,7 @@ export default async function handler(req, res) {
       message: err && err.message ? err.message : String(err),
       stack: err && err.stack ? err.stack : null
     });
-    return res.status(500).json({ error: 'Server error' });
+    const status = Number.isInteger(err?.status) && err.status >= 400 && err.status < 600 ? err.status : 500;
+    return res.status(status).json({ error: status === 500 ? 'Server error' : err.message || 'Request failed' });
   }
 }
