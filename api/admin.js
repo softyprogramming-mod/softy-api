@@ -282,7 +282,7 @@ async function normalizeManualInstagramUploadBuffer(upload) {
     throw err;
   }
   return sharp(raw)
-    .resize(1080, 1080, { fit: 'cover', position: 'centre' })
+    .resize(1920, 1080, { fit: 'cover', position: 'centre' })
     .jpeg({ quality: 92, mozjpeg: true })
     .toBuffer();
 }
@@ -381,14 +381,15 @@ async function createLaurelPostImageBuffer(sourceImageUrl, laurelUrl) {
     fetchImageBuffer(laurelUrl, 'white laurel')
   ]);
 
-  const size = 1080;
+  const width = 1920;
+  const height = 1080;
   const base = await sharp(sourceBuffer)
-    .resize(size, size, { fit: 'cover', position: 'centre' })
+    .resize(width, height, { fit: 'cover', position: 'centre' })
     .modulate({ brightness: 0.9 })
     .png()
     .toBuffer();
 
-  const laurelSize = Math.round(size * 0.42);
+  const laurelSize = Math.round(height * 0.42);
   const laurel = await sharp(laurelBuffer)
     .resize(laurelSize, laurelSize, { fit: 'inside' })
     .png()
@@ -396,15 +397,15 @@ async function createLaurelPostImageBuffer(sourceImageUrl, laurelUrl) {
 
   return sharp({
     create: {
-      width: size,
-      height: size,
+      width,
+      height,
       channels: 4,
       background: '#000000'
     }
   })
     .composite([
       { input: base, left: 0, top: 0 },
-      { input: laurel, left: Math.round((size - laurelSize) / 2), top: Math.round(size * 0.07) }
+      { input: laurel, left: Math.round((width - laurelSize) / 2), top: Math.round(height * 0.06) }
     ])
     .jpeg({ quality: 92, mozjpeg: true })
     .toBuffer();
