@@ -1272,6 +1272,9 @@ export default async function handler(req, res) {
       stack: err && err.stack ? err.stack : null
     });
     const status = Number.isInteger(err?.status) && err.status >= 400 && err.status < 600 ? err.status : 500;
-    return res.status(status).json({ error: status === 500 ? 'Server error' : err.message || 'Request failed' });
+    const adminSafeActions = new Set(['uploadInstagramImages', 'instagramPreview', 'postInstagram']);
+    const canShowMessage = adminSafeActions.has(String(req.query?.action || ''));
+    const message = err?.message || 'Request failed';
+    return res.status(status).json({ error: status === 500 && !canShowMessage ? 'Server error' : message });
   }
 }
