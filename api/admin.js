@@ -43,6 +43,7 @@ const ALLOWED_UPDATE_FIELDS = new Set([
   'review', 'twitter', 'onlinePremiere', 'completionDate', 'cast', 'language',
   'pending', 'live', 'accepted', 'timestamp', 'sortOrder',
   'autoPaused', 'autoPausedAt', 'autoPauseRemainingMs', 'scheduledDecisionAt',
+  'scheduledPublishAt', 'submissionReceivedEmailSent', 'submissionReceivedEmailAt', 'submissionReceivedEmailError',
   'autoResumedAt', 'instagramPostedAt', 'instagramPostId', 'instagramPostCaption',
   'instagramPostImageUrl', 'instagramPostImageUrls', 'instagramSourceImageUrl',
   'instagramManualImageUrls', 'instagramGeneratedLaurelIncluded', 'instagramPostType'
@@ -934,10 +935,12 @@ export default async function handler(req, res) {
       const raw = req.body && typeof req.body === 'object' ? req.body : {};
       const updates = {};
       for (const [k, v] of Object.entries(raw)) {
-        if (ALLOWED_UPDATE_FIELDS.has(k)) updates[k] = v;
+        if (k !== 'slug' && k !== 'timestamp' && ALLOWED_UPDATE_FIELDS.has(k)) updates[k] = v;
       }
 
-      await col.updateOne({ _id: oid }, { $set: updates });
+      if (!Object.keys(updates).length) return res.status(400).json({ error: 'No editable fields supplied' });
+      const result = await col.updateOne({ _id: oid }, { $set: updates });
+      if (!result.matchedCount) return res.status(404).json({ error: 'Film not found' });
       return res.status(200).json({ success: true });
     }
 
@@ -976,6 +979,7 @@ export default async function handler(req, res) {
       if (!film.email && emailOverride) {
         film.email = emailOverride;
       }
+      if (!skipEmail && film.scheduledPublishAt) return res.status(409).json({ error: 'Film is already scheduled for publication' });
       if (!skipEmail && !film.email) {
         return res.status(400).json({ error: 'Missing email on pending record' });
       }
@@ -1020,7 +1024,8 @@ export default async function handler(req, res) {
           $unset: {
             rejectionArcId: '',
             rejectionArcStartedAt: '',
-            rejectionArcCanceledAt: ''
+            rejectionArcCanceledAt: '',
+            scheduledPublishAt: ''
           }
         }
       );
@@ -1197,6 +1202,7 @@ export default async function handler(req, res) {
       if (!film.pending) {
         return res.status(400).json({ error: 'Reject action is only for pending submissions' });
       }
+      if (film.scheduledPublishAt) return res.status(409).json({ error: 'Film is already scheduled for publication' });
       if (film.rejectionArcActive === true) {
         return res.status(409).json({ error: 'Rejection arc already in progress for this submission' });
       }

@@ -4,6 +4,7 @@
 
 import clientPromise from '../lib/mongodb.js';
 import crypto from 'crypto';
+import { ObjectId } from 'mongodb';
 
 const DB_NAME = 'shortsoftheyear';
 const COLLECTION = 'films';
@@ -156,8 +157,18 @@ export default async function handler(req, res) {
       cleanFilm.live = typeof cleanFilm.live === 'boolean' ? cleanFilm.live : false;
       cleanFilm.accepted = typeof cleanFilm.accepted === 'boolean' ? cleanFilm.accepted : false;
 
-      await col.insertOne(cleanFilm);
-      return res.status(201).json({ success: true });
+      // Retrying the same submission after a lost response must not create another record.
+      const submissionId = typeof film.submissionId === 'string' ? film.submissionId : '';
+      if (/^submission_[a-zA-Z0-9_-]{1,100}$/.test(submissionId)) {
+        const existing = await col.findOne({ submissionId }, { projection: { _id: 1 } });
+        if (existing) return res.status(200).json({ success: true, id: String(existing._id) });
+        const id = new ObjectId(crypto.createHash('sha256').update(submissionId).digest('hex').slice(0, 24));
+        delete cleanFilm._id;
+        const result = await col.updateOne({ _id: id, submissionId }, { $setOnInsert: cleanFilm }, { upsert: true });
+        return res.status(result.upsertedCount ? 201 : 200).json({ success: true, id: String(id) });
+      }
+      const result = await col.insertOne(cleanFilm);
+      return res.status(201).json({ success: true, id: String(result.insertedId) });
     }
 
     return res.status(405).json({ error: 'Method not allowed' });
